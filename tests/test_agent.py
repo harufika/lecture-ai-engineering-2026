@@ -5,13 +5,15 @@ TestModel は実際のLLMを呼ばない偽モデルで、登録されたツー�
 「ツールが登録され、呼ばれ、結果がモデルに戻るか」を確かめられる。
 """
 
+import pytest
+
 from pydantic_ai import DeferredToolRequests
 from pydantic_ai.messages import ToolCallPart, ToolReturnPart
 from pydantic_ai.models.test import TestModel
 
 from app.agent import agent
 
-BASE_TOOLS = {"search_glossary", "get_lecture_summary"}
+BASE_TOOLS = {"search_glossary", "get_lecture_summary", "make_quiz"}
 
 
 def _parts(result, kind):
@@ -40,3 +42,48 @@ def test_glossary_result_reaches_the_model():
         result = agent.run_sync("RAGとは？")
     returns = _parts(result, ToolReturnPart)
     assert returns and returns[0].tool_name == "search_glossary"
+
+
+def test_save_learning_log_waits_for_approval(tmp_path, monkeypatch):
+    from app import tools
+
+    monkeypatch.setattr(tools, "__file__", str(tmp_path / "app" / "tools.py"))
+    result = agent.run_sync(
+        "学習内容を保存して",
+        model=TestModel(call_tools=["save_learning_log"]),
+    )
+
+    assert isinstance(result.output, DeferredToolRequests)
+    assert [call.tool_name for call in result.output.approvals] == ["save_learning_log"]
+    assert not (tmp_path / "learning_log").exists()
+
+
+@pytest.mark.parametrize("answer", ["y", "n", "", "yes", EOFError, KeyboardInterrupt])
+def test_cli_confirms_before_saving(tmp_path, monkeypatch, capsys, answer):
+    from app import tools
+    from app.agent import main
+
+    monkeypatch.setattr(tools, "__file__", str(tmp_path / "app" / "tools.py"))
+    monkeypatch.setattr("sys.argv", ["app.agent", "学習内容を保存して"])
+    monkeypatch.setattr(
+        "app.agent.build_model", lambda: TestModel(call_tools=["save_learning_log"])
+    )
+
+    def confirm(prompt):
+        assert "保存しますか" in prompt
+        assert not (tmp_path / "learning_log").exists()
+        assert "保存する学習記録：" in capsys.readouterr().out
+        if isinstance(answer, type):
+            raise answer()
+        return answer
+
+    monkeypatch.setattr("builtins.input", confirm)
+    main()
+
+    files = list((tmp_path / "learning_log").glob("*.md"))
+    if answer == "y":
+        assert len(files) == 1
+        assert files[0].read_text(encoding="utf-8")
+    else:
+        assert not files
+        assert "保存を拒否しました。" in capsys.readouterr().out
